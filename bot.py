@@ -51,9 +51,7 @@ def db():
 def init_db():
     with db() as conn:
 
-        # ----------------------------------------------------
         # User sessions
-        # ----------------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 user_id INTEGER PRIMARY KEY,
@@ -64,9 +62,7 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # Admin bot-generated messages
-        # ----------------------------------------------------
+        # Admin-side bot messages
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,19 +71,7 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # Map every admin message to its user
-        #
-        # This allows the admin to reply to:
-        # - User information message
-        # - Copied text
-        # - Copied photo
-        # - Copied video
-        # - Document
-        # - Voice
-        # - Sticker
-        # - etc.
-        # ----------------------------------------------------
+        # Admin message -> user mapping
         conn.execute("""
             CREATE TABLE IF NOT EXISTS message_users (
                 telegram_message_id INTEGER PRIMARY KEY,
@@ -96,13 +80,24 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
         # Blocked users
-        # ----------------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS blocked_users (
                 user_id INTEGER PRIMARY KEY,
                 blocked_at INTEGER NOT NULL
+            )
+        """)
+
+        # User-side bot messages
+        #
+        # These are the messages SENT BY THE BOT to the user.
+        # They can be deleted when /block or /endchat is used.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                telegram_message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             )
         """)
 
@@ -136,8 +131,14 @@ def create_session(user_id, username):
             (user_id, username, started_at, expires_at, active)
             VALUES (?, ?, ?, ?, 1)
             """,
-            (user_id, username or "", started, expires),
+            (
+                user_id,
+                username or "",
+                started,
+                expires,
+            ),
         )
+
         conn.commit()
 
 
@@ -151,6 +152,7 @@ def end_session(user_id):
             """,
             (user_id,),
         )
+
         conn.commit()
 
 
@@ -175,14 +177,16 @@ def is_blocked(user_id):
 def block_user(user_id):
     with db() as conn:
 
-        # Add to blocked list
         conn.execute(
             """
             INSERT OR REPLACE INTO blocked_users
             (user_id, blocked_at)
             VALUES (?, ?)
             """,
-            (user_id, now_ts()),
+            (
+                user_id,
+                now_ts(),
+            ),
         )
 
         # Immediately end active session
@@ -207,11 +211,12 @@ def unblock_user(user_id):
             """,
             (user_id,),
         )
+
         conn.commit()
 
 
 # ============================================================
-# ADMIN MESSAGE FUNCTIONS
+# ADMIN MESSAGE STORAGE
 # ============================================================
 
 def save_admin_message(message_id, user_id=None):
@@ -225,7 +230,10 @@ def save_admin_message(message_id, user_id=None):
             (telegram_message_id, created_at)
             VALUES (?, ?)
             """,
-            (message_id, current),
+            (
+                message_id,
+                current,
+            ),
         )
 
         if user_id is not None:
@@ -235,7 +243,11 @@ def save_admin_message(message_id, user_id=None):
                 (telegram_message_id, user_id, created_at)
                 VALUES (?, ?, ?)
                 """,
-                (message_id, user_id, current),
+                (
+                    message_id,
+                    user_id,
+                    current,
+                ),
             )
 
         conn.commit()
@@ -279,14 +291,145 @@ def delete_admin_message_record(record_id):
             """,
             (record_id,),
         )
+
         conn.commit()
 
 
 # ============================================================
-# DELETE OLD ADMIN BOT MESSAGES
+# USER-SIDE MESSAGE STORAGE
 # ============================================================
 
-async def cleanup_admin_messages(context: ContextTypes.DEFAULT_TYPE):
+def save_user_message(user_id, message_id):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_messages
+            (user_id, telegram_message_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                message_id,
+                now_ts(),
+            ),
+        )
+
+        conn.commit()
+
+
+def get_user_messages(user_id):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT id, telegram_message_id
+            FROM user_messages
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+
+
+def delete_user_message_record(record_id):
+    with db() as conn:
+        conn.execute(
+            """
+            DELETE FROM user_messages
+            WHERE id = ?
+            """,
+            (record_id,),
+        )
+
+        conn.commit()
+
+
+# ============================================================
+# DELETE ONLY BOT MESSAGES FROM USER SIDE
+# ============================================================
+
+async def clear_user_side(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+):
+    """
+    Deletes only messages that OUR BOT sent to the user.
+
+    It does NOT touch:
+    - Admin chat
+    - Admin messages
+    - User's own Telegram messages
+    """
+
+    rows = get_user_messages(user_id)
+
+    for record_id, message_id in rows:
+
+        try:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=message_id,
+            )
+
+            logger.info(
+                "Deleted user-side bot message %s for user %s",
+                message_id,
+                user_id,
+            )
+
+        except Exception as exc:
+            logger.info(
+                "Could not delete user-side message %s for user %s: %s",
+                message_id,
+                user_id,
+                exc,
+            )
+
+        delete_user_message_record(record_id)
+
+
+# ============================================================
+# SEND MESSAGE TO USER AND TRACK IT
+# ============================================================
+
+async def send_user_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    text: str,
+):
+    """
+    Sends a bot message to the user and stores its message ID
+    so it can later be deleted by /block or /endchat.
+    """
+
+    try:
+        sent = await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+        )
+
+        save_user_message(
+            user_id,
+            sent.message_id,
+        )
+
+        return sent
+
+    except Exception as exc:
+        logger.info(
+            "Could not send message to user %s: %s",
+            user_id,
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
+# OLD ADMIN MESSAGE CLEANUP
+# ============================================================
+
+async def cleanup_admin_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+):
     cutoff = now_ts() - DELETE_AFTER_HOURS * 3600
 
     rows = get_old_admin_messages(cutoff)
@@ -308,7 +451,6 @@ async def cleanup_admin_messages(context: ContextTypes.DEFAULT_TYPE):
 
         delete_admin_message_record(record_id)
 
-        # Also remove mapping
         with db() as conn:
             conn.execute(
                 """
@@ -317,59 +459,7 @@ async def cleanup_admin_messages(context: ContextTypes.DEFAULT_TYPE):
                 """,
                 (message_id,),
             )
-            conn.commit()
 
-
-# ============================================================
-# DELETE USER'S BOT-GENERATED ADMIN MESSAGES
-# ============================================================
-
-def get_admin_messages_for_user(user_id):
-    with db() as conn:
-        return conn.execute(
-            """
-            SELECT am.id, am.telegram_message_id
-            FROM admin_messages am
-            INNER JOIN message_users mu
-                ON am.telegram_message_id = mu.telegram_message_id
-            WHERE mu.user_id = ?
-            """,
-            (user_id,),
-        ).fetchall()
-
-
-async def clear_admin_messages_for_user(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-):
-    rows = get_admin_messages_for_user(user_id)
-
-    for record_id, message_id in rows:
-
-        try:
-            await context.bot.delete_message(
-                chat_id=ADMIN_ID,
-                message_id=message_id,
-            )
-
-        except Exception as exc:
-            logger.info(
-                "Could not delete admin message %s for user %s: %s",
-                message_id,
-                user_id,
-                exc,
-            )
-
-        delete_admin_message_record(record_id)
-
-        with db() as conn:
-            conn.execute(
-                """
-                DELETE FROM message_users
-                WHERE telegram_message_id = ?
-                """,
-                (message_id,),
-            )
             conn.commit()
 
 
@@ -377,7 +467,9 @@ async def clear_admin_messages_for_user(
 # EXPIRE SESSIONS
 # ============================================================
 
-async def expire_sessions(context: ContextTypes.DEFAULT_TYPE):
+async def expire_sessions(
+    context: ContextTypes.DEFAULT_TYPE,
+):
     current = now_ts()
 
     with db() as conn:
@@ -405,29 +497,21 @@ async def expire_sessions(context: ContextTypes.DEFAULT_TYPE):
 
         conn.commit()
 
-    # Notify users whose sessions expired
     for (user_id,) in rows:
 
-        # Never notify blocked users
+        # Blocked users stay completely silent
         if is_blocked(user_id):
             continue
 
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "⏰ Your chat session has ended.\n\n"
-                    "If you want to contact the admin again, "
-                    "send /start."
-                ),
-            )
-
-        except Exception as exc:
-            logger.info(
-                "Could not notify expired user %s: %s",
-                user_id,
-                exc,
-            )
+        await send_user_message(
+            context,
+            user_id,
+            (
+                "⏰ Your chat session has ended.\n\n"
+                "If you want to contact the admin again, "
+                "send /start."
+            ),
+        )
 
 
 # ============================================================
@@ -445,11 +529,9 @@ async def start(
         return
 
     # --------------------------------------------------------
-    # BLOCKED USER
-    #
-    # Completely silent.
-    # User receives absolutely nothing.
+    # BLOCKED USERS ARE COMPLETELY SILENT
     # --------------------------------------------------------
+
     if is_blocked(user.id):
         return
 
@@ -457,37 +539,53 @@ async def start(
     current = now_ts()
 
     # --------------------------------------------------------
-    # Existing active session
+    # ALREADY ACTIVE
     # --------------------------------------------------------
+
     if (
         session
         and session[4] == 1
         and session[3] > current
     ):
-        await message.reply_text(
+
+        sent = await message.reply_text(
             "⚠️ You are already in an active chat.\n\n"
             "Please send your message. "
             "The admin will contact you as soon as possible."
         )
+
+        # Track bot message
+        save_user_message(
+            user.id,
+            sent.message_id,
+        )
+
         return
 
     # --------------------------------------------------------
-    # Create new session
+    # NEW SESSION
     # --------------------------------------------------------
+
     create_session(
         user.id,
         user.username,
     )
 
-    await message.reply_text(
+    sent = await message.reply_text(
         "🔐 Anonymous chat started.\n\n"
         "Please send your message. "
         "The admin will contact you as soon as possible."
     )
 
+    # Track bot message
+    save_user_message(
+        user.id,
+        sent.message_id,
+    )
+
 
 # ============================================================
-# USER INFORMATION
+# USER INFO FOR ADMIN
 # ============================================================
 
 def get_user_info(user):
@@ -507,7 +605,7 @@ def get_user_info(user):
 
 
 # ============================================================
-# GET USER ID FROM REPLY
+# GET USER FROM ADMIN REPLY
 # ============================================================
 
 def get_reply_target_user_id(message):
@@ -516,19 +614,7 @@ def get_reply_target_user_id(message):
 
     replied = message.reply_to_message
 
-    # --------------------------------------------------------
-    # First: database mapping
-    #
-    # This handles copied:
-    # - text
-    # - photos
-    # - videos
-    # - documents
-    # - stickers
-    # - voice
-    # - animations
-    # - etc.
-    # --------------------------------------------------------
+    # First use database mapping
     user_id = get_user_from_admin_message(
         replied.message_id
     )
@@ -536,12 +622,11 @@ def get_reply_target_user_id(message):
     if user_id:
         return user_id
 
-    # --------------------------------------------------------
-    # Fallback: read User ID from information message
-    # --------------------------------------------------------
+    # Fallback: read User ID from info message
     text = replied.text or replied.caption or ""
 
     if text:
+
         for line in text.splitlines():
 
             if line.startswith("👤 User ID:"):
@@ -568,7 +653,7 @@ async def block_command(
     message = update.effective_message
     user = update.effective_user
 
-    # Only admin can use this command
+    # Only admin
     if not user or user.id != ADMIN_ID:
         return
 
@@ -578,20 +663,25 @@ async def block_command(
     target_user_id = None
 
     # --------------------------------------------------------
-    # Preferred:
-    # Reply to user's message and send /block
+    # Reply to user's message
     # --------------------------------------------------------
+
     if message.reply_to_message:
-        target_user_id = get_reply_target_user_id(message)
+        target_user_id = get_reply_target_user_id(
+            message
+        )
 
     # --------------------------------------------------------
-    # Also support:
-    # /block 123456789
+    # /block USER_ID
     # --------------------------------------------------------
+
     if not target_user_id and context.args:
 
         try:
-            target_user_id = int(context.args[0])
+            target_user_id = int(
+                context.args[0]
+            )
+
         except ValueError:
             target_user_id = None
 
@@ -601,30 +691,39 @@ async def block_command(
             "⚠️ Reply to a user's message with /block "
             "or use /block USER_ID."
         )
+
         return
 
-    # Never allow accidentally blocking yourself
     if target_user_id == ADMIN_ID:
 
         await message.reply_text(
             "❌ You cannot block yourself."
         )
+
         return
 
     # --------------------------------------------------------
-    # Block silently
+    # BLOCK USER
     # --------------------------------------------------------
+
     block_user(target_user_id)
 
-    # Clear bot-generated admin-side conversation messages
-    await clear_admin_messages_for_user(
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # ONLY USER SIDE IS CLEARED.
+    #
+    # ADMIN SIDE IS NOT TOUCHED.
+    # --------------------------------------------------------
+
+    await clear_user_side(
         context,
         target_user_id,
     )
 
     # --------------------------------------------------------
-    # Confirmation only to ADMIN
+    # ADMIN CONFIRMATION
     # --------------------------------------------------------
+
     await message.reply_text(
         f"🚫 User {target_user_id} has been blocked."
     )
@@ -646,7 +745,6 @@ async def unblock_command(
     message = update.effective_message
     user = update.effective_user
 
-    # Only admin
     if not user or user.id != ADMIN_ID:
         return
 
@@ -658,19 +756,24 @@ async def unblock_command(
     # --------------------------------------------------------
     # Reply method
     # --------------------------------------------------------
+
     if message.reply_to_message:
-        target_user_id = get_reply_target_user_id(message)
+
+        target_user_id = get_reply_target_user_id(
+            message
+        )
 
     # --------------------------------------------------------
     # /unblock USER_ID
-    #
-    # Useful if the original blocked messages were already
-    # deleted.
     # --------------------------------------------------------
+
     if not target_user_id and context.args:
 
         try:
-            target_user_id = int(context.args[0])
+            target_user_id = int(
+                context.args[0]
+            )
+
         except ValueError:
             target_user_id = None
 
@@ -680,11 +783,13 @@ async def unblock_command(
             "⚠️ Reply to a user's message with /unblock "
             "or use /unblock USER_ID."
         )
+
         return
 
     # --------------------------------------------------------
-    # Remove block
+    # UNBLOCK
     # --------------------------------------------------------
+
     unblock_user(target_user_id)
 
     await message.reply_text(
@@ -709,7 +814,6 @@ async def endchat_command(
     message = update.effective_message
     user = update.effective_user
 
-    # Only admin
     if not user or user.id != ADMIN_ID:
         return
 
@@ -721,16 +825,24 @@ async def endchat_command(
     # --------------------------------------------------------
     # Reply method
     # --------------------------------------------------------
+
     if message.reply_to_message:
-        target_user_id = get_reply_target_user_id(message)
+
+        target_user_id = get_reply_target_user_id(
+            message
+        )
 
     # --------------------------------------------------------
     # /endchat USER_ID
     # --------------------------------------------------------
+
     if not target_user_id and context.args:
 
         try:
-            target_user_id = int(context.args[0])
+            target_user_id = int(
+                context.args[0]
+            )
+
         except ValueError:
             target_user_id = None
 
@@ -740,42 +852,49 @@ async def endchat_command(
             "⚠️ Reply to a user's message with /endchat "
             "or use /endchat USER_ID."
         )
+
         return
 
     # --------------------------------------------------------
-    # End session
+    # END SESSION
     # --------------------------------------------------------
+
     end_session(target_user_id)
 
     # --------------------------------------------------------
-    # Tell user their chat ended
+    # USER-SIDE ONLY
+    #
+    # Send ending notification first.
+    # Then clear all bot-generated user-side messages,
+    # including this one.
     # --------------------------------------------------------
+
     if not is_blocked(target_user_id):
 
-        try:
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=(
-                    "⏹️ Your chat session has ended.\n\n"
-                    "If you want to contact the admin again, "
-                    "send /start."
-                ),
-            )
-
-        except Exception as exc:
-            logger.info(
-                "Could not notify user %s about /endchat: %s",
-                target_user_id,
-                exc,
-            )
+        await send_user_message(
+            context,
+            target_user_id,
+            (
+                "⏹️ Your chat session has ended.\n\n"
+                "If you want to contact the admin again, "
+                "send /start."
+            ),
+        )
 
     # --------------------------------------------------------
-    # Clear bot-generated admin-side messages
+    # CLEAR ONLY USER SIDE
+    #
+    # NOTHING IS DELETED FROM ADMIN CHAT.
     # --------------------------------------------------------
-    await clear_admin_messages_for_user(
+
+    await clear_user_side(
         context,
         target_user_id,
     )
+
+    # --------------------------------------------------------
+    # ADMIN CONFIRMATION
+    # --------------------------------------------------------
 
     await message.reply_text(
         f"⏹️ Chat with User {target_user_id} has ended."
@@ -804,27 +923,30 @@ async def forward_user_message(
     # --------------------------------------------------------
     # ADMIN
     # --------------------------------------------------------
+
     if user.id == ADMIN_ID:
+
         await handle_admin_reply(
             update,
             context,
         )
+
         return
 
     # --------------------------------------------------------
     # BLOCKED USER
     #
-    # Completely silent.
-    # No message.
-    # No error.
-    # No indication they are blocked.
+    # SILENT.
+    # NO RESPONSE.
     # --------------------------------------------------------
+
     if is_blocked(user.id):
         return
 
     # --------------------------------------------------------
-    # Check active session
+    # SESSION CHECK
     # --------------------------------------------------------
+
     session = get_session(user.id)
     current = now_ts()
 
@@ -837,16 +959,20 @@ async def forward_user_message(
         if session and session[4] == 1:
             end_session(user.id)
 
-        await message.reply_text(
-            "⏰ Your chat session has ended.\n\n"
-            "If you want to contact the admin again, "
-            "send /start."
+        await send_user_message(
+            context,
+            user.id,
+            (
+                "⏰ Your chat session has ended.\n\n"
+                "If you want to contact the admin again, "
+                "send /start."
+            ),
         )
 
         return
 
     # ========================================================
-    # SEND USER INFORMATION TO ADMIN
+    # SEND IDENTIFICATION TO ADMIN
     # ========================================================
 
     try:
@@ -856,6 +982,7 @@ async def forward_user_message(
             text=get_user_info(user),
         )
 
+        # Keep admin-side message
         save_admin_message(
             info_message.message_id,
             user.id,
@@ -871,7 +998,7 @@ async def forward_user_message(
         return
 
     # ========================================================
-    # COPY ACTUAL USER MESSAGE
+    # COPY USER MESSAGE TO ADMIN
     # ========================================================
 
     try:
@@ -880,7 +1007,7 @@ async def forward_user_message(
             chat_id=ADMIN_ID
         )
 
-        # Save both message ID and user ID
+        # Keep admin-side message
         save_admin_message(
             copied_message.message_id,
             user.id,
@@ -917,8 +1044,14 @@ async def forward_user_message(
 
     try:
 
-        await message.reply_text(
+        sent = await message.reply_text(
             "✅ Your message has been sent to the admin."
+        )
+
+        # Track user-side bot message
+        save_user_message(
+            user.id,
+            sent.message_id,
         )
 
     except Exception:
@@ -938,15 +1071,14 @@ async def handle_admin_reply(
     if not message:
         return
 
-    # --------------------------------------------------------
-    # Commands are handled by CommandHandler.
-    # --------------------------------------------------------
+    # Commands are handled by CommandHandler
     if message.text and message.text.startswith("/"):
         return
 
     # --------------------------------------------------------
-    # Admin must use Telegram Reply.
+    # Admin must use Telegram's normal Reply
     # --------------------------------------------------------
+
     if not message.reply_to_message:
 
         await message.reply_text(
@@ -959,7 +1091,10 @@ async def handle_admin_reply(
     # --------------------------------------------------------
     # Find target user
     # --------------------------------------------------------
-    user_id = get_reply_target_user_id(message)
+
+    user_id = get_reply_target_user_id(
+        message
+    )
 
     if not user_id:
 
@@ -971,8 +1106,9 @@ async def handle_admin_reply(
         return
 
     # --------------------------------------------------------
-    # Don't send anything to blocked users
+    # Blocked user
     # --------------------------------------------------------
+
     if is_blocked(user_id):
 
         await message.reply_text(
@@ -982,8 +1118,9 @@ async def handle_admin_reply(
         return
 
     # --------------------------------------------------------
-    # Check session
+    # Session check
     # --------------------------------------------------------
+
     session = get_session(user_id)
     current = now_ts()
 
@@ -1000,13 +1137,19 @@ async def handle_admin_reply(
         return
 
     # ========================================================
-    # COPY ADMIN MESSAGE TO USER
+    # SEND ADMIN REPLY TO USER
     # ========================================================
 
     try:
 
-        await message.copy(
+        copied = await message.copy(
             chat_id=user_id
+        )
+
+        # Track bot-generated message on user side
+        save_user_message(
+            user_id,
+            copied.message_id,
         )
 
     except Exception as exc:
@@ -1026,19 +1169,21 @@ async def handle_admin_reply(
 # POST INIT
 # ============================================================
 
-async def post_init(application: Application):
+async def post_init(
+    application: Application,
+):
     init_db()
 
     if application.job_queue:
 
-        # Check expired sessions every minute
+        # Expire sessions every minute
         application.job_queue.run_repeating(
             expire_sessions,
             interval=60,
             first=10,
         )
 
-        # Clean old admin bot messages every 5 minutes
+        # Delete old ADMIN-SIDE bot messages every 5 minutes
         application.job_queue.run_repeating(
             cleanup_admin_messages,
             interval=300,
@@ -1064,9 +1209,9 @@ def main():
         .build()
     )
 
-    # ========================================================
-    # USER COMMAND
-    # ========================================================
+    # --------------------------------------------------------
+    # USER /start
+    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -1075,12 +1220,9 @@ def main():
         )
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # ADMIN COMMANDS
-    #
-    # These must be registered BEFORE the general message
-    # handler.
-    # ========================================================
+    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -1103,24 +1245,9 @@ def main():
         )
     )
 
-    # ========================================================
-    # ALL OTHER TELEGRAM MESSAGES
-    #
-    # This allows:
-    # text
-    # photos
-    # videos
-    # documents
-    # audio
-    # voice
-    # stickers
-    # GIFs
-    # animations
-    # contacts
-    # locations
-    # polls
-    # etc.
-    # ========================================================
+    # --------------------------------------------------------
+    # ALL OTHER TELEGRAM MESSAGE TYPES
+    # --------------------------------------------------------
 
     application.add_handler(
         MessageHandler(
@@ -1129,9 +1256,9 @@ def main():
         )
     )
 
-    # ========================================================
-    # START
-    # ========================================================
+    # --------------------------------------------------------
+    # START BOT
+    # --------------------------------------------------------
 
     logger.info(
         "WALAWWA Anonymous Admin Bot starting..."
